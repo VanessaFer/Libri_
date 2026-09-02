@@ -31,6 +31,8 @@ from rating_widget import book_rating_input
 from theme import inject_theme, status_badge, formato_badge, INK_GREEN, GOLD_LIGHT
 from icons import BOOK_SVG, SEARCH_SVG, GEAR_SVG, UPLOAD_SVG, LINK_SVG
 
+APP_URL = "https://bibliophile-library.streamlit.app/"
+
 st.set_page_config(page_title="La mia libreria", page_icon="📚")
 inject_theme()
 
@@ -776,7 +778,10 @@ def render_my_library():
             f"{(e.get('books') or {}).get('author') or 'Autore N/D'}"
             for e in entries
         )
-        telegram_url = "https://t.me/share/url?text=" + urllib.parse.quote(share_text)
+        telegram_url = (
+            "https://t.me/share/url?url=" + urllib.parse.quote(APP_URL)
+            + "&text=" + urllib.parse.quote(share_text)
+        )
         whatsapp_url = "https://wa.me/?text=" + urllib.parse.quote(share_text)
 
         df = pd.DataFrame([
