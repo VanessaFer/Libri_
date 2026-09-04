@@ -1310,9 +1310,38 @@ with st.sidebar:
     if user_is_admin:
         nav_links.append(("admin", "Admin", GEAR_SVG))
 
+    st.markdown(
+        f"""
+        <style>
+        {"".join(f'''
+        div[data-testid="stButton"].st-key-nav_{key} button {{
+            width: 100%;
+            text-align: left;
+            justify-content: flex-start;
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 16px;
+            color: {INK_GREEN};
+            border: none;
+            {"background:" + GOLD_LIGHT + "; font-weight:600;" if current_nav == key else "background:transparent;"}
+            margin-bottom: 4px;
+        }}
+        div[data-testid="stButton"].st-key-nav_{key} button:hover {{
+            background: {GOLD_LIGHT};
+        }}
+        ''' for key, _, _ in nav_links)}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    nav_icons = {"libreria": "📚", "cerca": "🔍", "importa": "⬆️", "link": "🔗", "admin": "⚙️"}
+
     for key, label, svg in nav_links:
-        style = NAV_LINK_ACTIVE_STYLE if current_nav == key else NAV_LINK_STYLE
-        st.markdown(f'<a href="?nav={key}" target="_self" style="{style}">{svg} {label}</a>', unsafe_allow_html=True)
+        if st.button(f"{nav_icons.get(key, '')} {label}", key=f"nav_{key}"):
+            st.query_params["nav"] = key
+            st.rerun()
 
 # Un link cliccato ricarica la pagina: la scheda libro eventualmente aperta
 # si chiude automaticamente insieme al resto dello stato non salvato.
