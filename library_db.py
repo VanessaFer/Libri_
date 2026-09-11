@@ -688,11 +688,13 @@ def get_existing_publishers(limit: int = 500) -> list[str]:
 # Funzione di comodo: salva edizione + stato in un colpo solo, dato un work_id già risolto
 # ---------------------------------------------------------------------------
 
-def save_book_with_status(book: dict, work_id: str, user_id: str, status: str, auto_approve: bool = False) -> str | None:
+def save_book_with_status(
+    book: dict, work_id: str, user_id: str, status: str, auto_approve: bool = False, formato=_NOT_PROVIDED
+) -> str | None:
     """Crea/riusa l'edizione (collegata al work_id dato) e la associa all'utente. Restituisce il book_id."""
     try:
         book_id = upsert_book(book, work_id, auto_approve)
-        ok = add_to_user_library(user_id, book_id, status)
+        ok = add_to_user_library(user_id, book_id, status, formato=formato)
         return book_id if ok else None
     except Exception as e:
         st.error(f"Errore durante il salvataggio del libro: {e}")

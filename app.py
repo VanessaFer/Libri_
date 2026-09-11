@@ -8,6 +8,11 @@ import io
 import urllib.parse
 import pandas as pd
 from book_matching import find_book_candidates
+from recommendations import get_recommendations
+from on_this_day import get_todays_literary_events
+from streamlit_folium import st_folium
+from authors_map import get_general_authors_geo, build_timeline_map, NO_MOVEMENT_LABEL
+from reading_lists import get_reading_lists, get_reading_list_items, get_reading_list_progress
 from auth import require_login, get_current_user, sign_out
 from library_db import (
     save_book_with_status, get_username,
@@ -64,6 +69,15 @@ def status_selector(key_prefix: str) -> str:
     return STATUS_OPTIONS[label]
 
 
+FORMATO_RELEVANT_STATUSES = ("comprato_non_letto", "in_lettura", "letto")
+
+
+def _default_formato_for_status(status: str):
+    """Cartaceo di default quando il formato ha senso (non per la wishlist,
+    dove il libro non è ancora posseduto)."""
+    return "cartaceo" if status in FORMATO_RELEVANT_STATUSES else None
+
+
 # ---------------------------------------------------------------------------
 # Flusso di salvataggio con risoluzione dell'opera (con conferma se ambigua)
 # ---------------------------------------------------------------------------
@@ -82,7 +96,10 @@ def start_add_flow(book: dict, status: str):
     similar = find_similar_works(book.get("title", ""))
     if not similar:
         work_id = create_work(book.get("title"), _resolve_author_names(book))
-        book_id = save_book_with_status(book, work_id, user["id"], status, auto_approve=user_is_admin)
+        book_id = save_book_with_status(
+            book, work_id, user["id"], status, auto_approve=user_is_admin,
+            formato=_default_formato_for_status(status),
+        )
         if book_id:
             st.session_state["last_added_book_id"] = book_id
             st.success(f"'{book['title']}' salvato nella tua libreria!")
@@ -117,7 +134,10 @@ def render_pending_add_confirmation():
                 if author_names:
                     link_authors_to_work(work_id, author_names)
 
-            book_id = save_book_with_status(pending["book"], work_id, user["id"], pending["status"], auto_approve=user_is_admin)
+            book_id = save_book_with_status(
+                pending["book"], work_id, user["id"], pending["status"], auto_approve=user_is_admin,
+                formato=_default_formato_for_status(pending["status"]),
+            )
             if book_id:
                 st.session_state["last_added_book_id"] = book_id
                 st.success(f"'{pending['book']['title']}' salvato nella tua libreria!")
@@ -235,7 +255,7 @@ def render_book_detail(book_id: str):
         new_status = STATUS_OPTIONS[new_status_label]
 
         new_formato = current_formato
-        formato_relevant = new_status in ("comprato_non_letto", "in_lettura", "letto")
+        formato_relevant = new_status in FORMATO_RELEVANT_STATUSES
         if formato_relevant:
             formato_options = {"Cartaceo": "cartaceo", "Digitale": "digitale", "Audiolibro": "audiolibro"}
             labels = list(formato_options.keys())
@@ -659,8 +679,52 @@ STATUS_BADGE_LABELS = {
 }
 
 
+def render_library_intro():
+    st.markdown(
+        f"""
+        <div style="background:{GOLD_LIGHT}; border-radius:10px; padding:18px 22px; margin-bottom:1.2rem;
+                    font-family:'EB Garamond',Georgia,serif;">
+            <p style="color:{INK_GREEN}; font-size:16px; line-height:1.5; margin:0;">
+                Non tutti i libri che possiedi devono essere già stati letti. Chi studia le grandi
+                biblioteche private ha notato che i libri non letti — la cosiddetta <strong>antibiblioteca</strong> —
+                contano quanto quelli letti: sono una riserva di possibilità, di domande ancora aperte,
+                di direzioni che potresti prendere. Più che un elenco di conquiste, una libreria dovrebbe
+                essere uno strumento di ricerca.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("💬 Una citazione di Umberto Eco sull'antibiblioteca"):
+        st.markdown(
+            f"""
+            <div style="font-family:'EB Garamond',Georgia,serif; font-style:italic; color:{INK_GREEN};
+                        line-height:1.6; font-size:15px;">
+                «È sciocco pensare di dover leggere tutti i libri che compri, come è sciocco criticare
+                chi compra più libri di quanti ne potrà mai leggere. Sarebbe come dire che dovresti usare
+                tutte le posate o occhiali, cacciaviti o punte da trapano acquistati prima di acquistarne
+                di nuovi.<br><br>
+                Ci sono cose nella vita di cui abbiamo bisogno di avere sempre scorte in abbondanza, anche
+                se ne utilizzeremo solo una piccola parte.<br><br>
+                Se, ad esempio, consideriamo i libri come una medicina, capiamo che è bene averne tanti in
+                casa piuttosto che pochi: quando vuoi stare meglio, allora vai all'"armadio dei medicinali"
+                e scegli un libro, uno a caso, ma il libro giusto per quel momento. Ecco perché dovresti
+                sempre avere una scelta nutriente!<br><br>
+                Chi compra un solo libro, legge solo quello e poi se ne sbarazza. Applica semplicemente ai
+                libri la mentalità consumistica, cioè li considera un prodotto di consumo, un bene. Chi ama
+                i libri sa che un libro è tutt'altro che una merce.»
+            </div>
+            <p style="text-align:right; color:{INK_GREEN}; font-family:'EB Garamond',Georgia,serif; margin-top:0.6rem;">
+                — Umberto Eco
+            </p>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def render_my_library():
     page_heading(BOOK_SVG, "La mia libreria")
+    render_library_intro()
 
     all_entries = get_user_books(user["id"])
 
@@ -1175,6 +1239,145 @@ def _render_import_summary():
 
 
 
+def _render_recommendation_card(book: dict, index: int, key_prefix: str):
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if book.get("cover_url"):
+            st.image(book["cover_url"], width=80)
+        else:
+            st.write("🖼️")
+    with col2:
+        st.markdown(f"**{book.get('title', 'Titolo sconosciuto')}**")
+        st.caption(f"{book.get('author', 'Autore N/D')} · {book.get('year', 'anno N/D')} · {book.get('publisher', 'editore N/D')}")
+        match_label = "autore" if book.get("matched_on_type") == "autore" else "tag"
+        st.caption(f"✨ Suggerito perché ti piace {match_label} **{book.get('matched_on')}**")
+
+        if book.get("synopsis"):
+            with st.expander("📖 Leggi la sinossi"):
+                st.write(book["synopsis"])
+
+        status = status_selector(key_prefix=f"{key_prefix}_{index}")
+        if st.button("Aggiungi alla libreria", key=f"addlib_{key_prefix}_{index}"):
+            start_add_flow(book, status)
+    st.divider()
+
+
+def render_esplora():
+    page_heading(SEARCH_SVG, "Esplora")
+    col_caption, col_refresh = st.columns([5, 1])
+    with col_caption:
+        st.caption("Consigli di lettura e uno sguardo geografico/storico sugli autori.")
+    with col_refresh:
+        if st.button("🔄 Aggiorna consigli", key="refresh_esplora"):
+            get_recommendations.clear()
+            st.rerun()
+
+    tab_amati, tab_letti, tab_mappa, tab_liste = st.tabs(
+        ["Nei tuoi gusti", "Dal tuo scaffale", "Mappa degli autori", "Liste di lettura"]
+    )
+
+    with tab_amati:
+        with st.spinner("Cerco suggerimenti tra i libri che hai amato di più..."):
+            amati = get_recommendations(user["id"], mode="amati")
+        if not amati:
+            st.info(
+                "Non ho trovato abbastanza libri valutati con 4-5 stelle e con tag/autore "
+                "associati per generare suggerimenti qui. Vota o taggare qualche libro in più."
+            )
+        else:
+            for i, book in enumerate(amati):
+                _render_recommendation_card(book, i, key_prefix="esplora_amati")
+
+    with tab_letti:
+        with st.spinner("Cerco suggerimenti tra tutto quello che hai letto..."):
+            letti = get_recommendations(user["id"], mode="letti")
+        if not letti:
+            st.info(
+                "Non ho trovato abbastanza libri letti e taggati/con autore per generare "
+                "suggerimenti qui. Segna qualche libro come letto e aggiungi tag/autori."
+            )
+        else:
+            for i, book in enumerate(letti):
+                _render_recommendation_card(book, i, key_prefix="esplora_letti")
+
+    with tab_mappa:
+        st.caption(
+            "Luoghi di nascita e morte dei grandi autori della storia, con uno slider per "
+            "vedere come si spostano nel tempo. Dati da Wikidata, aggiornati una volta al giorno."
+        )
+
+        with st.spinner("Carico i grandi autori della storia da Wikidata..."):
+            map_events = get_general_authors_geo()
+
+        if not map_events:
+            st.info("Nessun dato geografico disponibile al momento per generare la mappa.")
+        else:
+            all_movements = sorted({
+                m for ev in map_events for m in (ev.get("movements") or [NO_MOVEMENT_LABEL])
+            })
+            selected_movements = st.multiselect(
+                "Filtra per corrente letteraria",
+                options=all_movements,
+                default=[],
+                help="Nessuna selezione = mostra tutti gli autori.",
+            )
+
+            if selected_movements:
+                filtered_events = [
+                    ev for ev in map_events
+                    if set(ev.get("movements") or [NO_MOVEMENT_LABEL]) & set(selected_movements)
+                ]
+            else:
+                filtered_events = map_events
+
+            if not filtered_events:
+                st.info("Nessun autore corrisponde ai filtri selezionati.")
+            else:
+                fmap = build_timeline_map(filtered_events)
+                st_folium(fmap, width=None, height=520, key="authors_map_general")
+
+    with tab_liste:
+        st.caption(
+            "Liste di libri curate da altri (BBC, Le Monde, 1001 libri da leggere nella "
+            "vita), con lo stato di lettura calcolato automaticamente in base a cosa hai "
+            "già segnato come letto nella tua libreria."
+        )
+
+        reading_lists = get_reading_lists()
+        if not reading_lists:
+            st.info("Nessuna lista di lettura disponibile al momento.")
+        else:
+            for reading_list in reading_lists:
+                items = get_reading_list_items(reading_list["id"])
+                with st.spinner(f"Calcolo i libri letti in \"{reading_list['name']}\"..."):
+                    progress = get_reading_list_progress(user["id"], reading_list["id"], items=items)
+
+                st.markdown(f"#### {reading_list['name']}")
+                if reading_list.get("description"):
+                    st.caption(reading_list["description"])
+
+                total = progress["total"]
+                read_count = progress["read_count"]
+                st.progress(read_count / total if total else 0)
+                st.write(f"**{read_count} / {total}** libri letti")
+
+                with st.expander("Vedi tutti i libri della lista"):
+                    sections = {}
+                    for item in progress["items"]:
+                        sections.setdefault(item.get("section"), []).append(item)
+
+                    for section, section_items in sections.items():
+                        if section:
+                            st.markdown(f"**{section}**")
+                        rows = [
+                            f"{'✅' if item['read'] else '⬜'} {item['title']} — *{item.get('author') or 'N/D'}*"
+                            for item in section_items
+                        ]
+                        st.markdown("\n\n".join(rows))
+
+                st.divider()
+
+
 def render_search_and_add():
     page_heading(SEARCH_SVG, "Cerca e aggiungi")
     query = st.text_input("Titolo (e opzionalmente autore)", placeholder="es. Notre-Dame de Paris Victor Hugo")
@@ -1300,10 +1503,30 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.markdown(
+        f'<span style="font-family:\'EB Garamond\',Georgia,serif; font-size:14px; '
+        f'font-weight:600; color:{INK_GREEN};">📅 Accadde oggi</span>',
+        unsafe_allow_html=True,
+    )
+    todays_events = get_todays_literary_events()
+    if not todays_events:
+        st.caption("Nessun evento letterario notevole risulta per oggi.")
+    else:
+        for ev in todays_events:
+            verb = "nasceva" if ev["event"] == "nascita" else "moriva"
+            st.markdown(
+                f'<div style="font-family:\'EB Garamond\',Georgia,serif; font-size:13px; '
+                f'color:{INK_GREEN}; margin-bottom:4px;">'
+                f'<strong>{ev["year"]}</strong> — {verb} <a href="{ev["url"]}" target="_blank" '
+                f'style="color:{INK_GREEN};">{ev["name"]}</a></div>',
+                unsafe_allow_html=True,
+            )
+    st.divider()
 
     nav_links = [
         ("libreria", "La mia libreria", BOOK_SVG),
         ("cerca", "Cerca e aggiungi", SEARCH_SVG),
+        ("esplora", "Esplora", SEARCH_SVG),
         ("importa", "Importa libri", UPLOAD_SVG),
         ("link", "Link utili", LINK_SVG),
     ]
@@ -1336,7 +1559,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    nav_icons = {"libreria": "📚", "cerca": "🔍", "importa": "⬆️", "link": "🔗", "admin": "⚙️"}
+    nav_icons = {"libreria": "📚", "cerca": "🔍", "esplora": "🧭", "importa": "⬆️", "link": "🔗", "admin": "⚙️"}
 
     for key, label, svg in nav_links:
         if st.button(f"{nav_icons.get(key, '')} {label}", key=f"nav_{key}"):
@@ -1353,6 +1576,8 @@ elif current_nav == "admin" and user_is_admin:
     render_admin_panel()
 elif current_nav == "cerca":
     render_search_and_add()
+elif current_nav == "esplora":
+    render_esplora()
 elif current_nav == "importa":
     render_import()
 elif current_nav == "link":
