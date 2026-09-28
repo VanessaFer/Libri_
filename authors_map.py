@@ -1,17 +1,19 @@
 """
 Mappa interattiva degli autori: luoghi di nascita/morte con uno slider
-temporale per vedere come cambiano nel tempo. I dati geografici vengono
-da Wikidata, la mappa viene disegnata con Folium (plugin TimestampedGeoJson).
+temporale per vedere come cambiano nel tempo. La mappa viene disegnata con
+Folium (plugin TimestampedGeoJson).
 
-Due modalità:
-- "libreria": solo gli autori presenti nella libreria dell'utente (works ->
-  work_authors -> authors), cercati singolarmente su Wikidata per nome.
-- "generale": i grandi autori della storia in generale, indipendentemente
-  dalla libreria, filtrati per notabilità (numero di sitelink Wikidata).
+I dati per la modalità "generale" (i grandi autori della storia) vengono
+letti dalla tabella notable_authors, precaricata una tantum dallo script
+populate_notable_authors.py — non da Wikidata in tempo reale, per evitare i
+caricamenti lenti di prima (soprattutto quando l'app si "risveglia" su
+Streamlit Cloud e perde la cache in memoria).
 
-Entrambe le modalità restano in cache per un giorno: i dati non cambiano
-da un momento all'altro, e ogni ricerca per nome comporta una chiamata
-di rete a Wikidata (lente se ripetute a ogni apertura della mappa).
+La modalità "libreria" (autori della propria libreria, cercati per nome)
+resta invece basata su ricerche dirette a Wikidata: qui i dati sono
+per forza specifici per utente, non precaricabili in una tabella condivisa.
+Attualmente non è collegata alla UI (rimossa perché troppo lenta), ma le
+funzioni restano pronte come base per un'eventuale ripresa futura.
 """
 
 import re
@@ -28,15 +30,14 @@ WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
 USER_AGENT = "BibliophileLibraryApp/1.0 (webapp personale di tracciamento libri)"
 
 REQUEST_DELAY_SECONDS = 0.3
-MIN_SITELINKS_GENERAL = 30
 
 # Stesso elenco di occupazioni letterarie usato in on_this_day.py: scrittore,
-# poeta, romanziere, drammaturgo, saggista. Usare un elenco esplicito (invece
-# di un pattern con wildcard su tutte le sottocategorie) evita query troppo
-# pesanti che vanno spesso in timeout sui server pubblici di Wikidata.
+# poeta, romanziere, drammaturgo, saggista.
 LITERARY_OCCUPATIONS = ["Q36180", "Q49757", "Q6625963", "Q214917", "Q11774202"]
 
 POINT_RE = re.compile(r"Point\(([-\d.]+) ([-\d.]+)\)")
+
+NO_MOVEMENT_LABEL = "Non specificata"
 
 
 def _run_sparql(query: str) -> list[dict]:
@@ -67,11 +68,8 @@ def _parse_point(value: str | None):
 def _safe_date10(value: str | None) -> str | None:
     """
     Restituisce i primi 10 caratteri (YYYY-MM-DD) di una data ISO di Wikidata,
-    oppure None per le date precedenti all'anno 0 (a.C.). Queste ultime
-    arrivano da Wikidata in un formato con il segno meno (es. "-0043-01-03..."
-    per Cicerone), che uno slicing ingenuo tronca in modo scorretto e che i
-    browser gestiscono comunque male nello slider temporale: meglio escluderle
-    con chiarezza che rischiare di rompere l'intera timeline.
+    oppure None per le date precedenti all'anno 0 (a.C.), che uno slicing
+    ingenuo tronca in modo scorretto.
     """
     if not value or value.startswith("-"):
         return None
@@ -103,134 +101,43 @@ def _rows_to_events(rows: list[dict]) -> list[dict]:
     return events
 
 
-# Fasce temporali (anno inizio, anno fine, quanti autori prendere per fascia).
-# Selezionare un contingente per epoca, invece di una classifica unica per
-# notorietà globale, evita che gli autori moderni (tradotti in centinaia di
-# lingue su Wikipedia) "schiaccino" quelli medievali/rinascimentali, che
-# altrimenti sparirebbero quasi del tutto dalla mappa.
-ERA_BUCKETS = [
-    (1, 500, 12),
-    (501, 1000, 12),
-    (1001, 1400, 15),
-    (1401, 1600, 15),
-    (1601, 1750, 15),
-    (1751, 1850, 15),
-    (1851, 1920, 20),
-    (1921, 1970, 20),
-    (1971, 2026, 20),
-]
-
-
-def _top_person_qids_all_eras() -> list[str]:
-    """
-    QID degli autori più noti (per sitelink) in ciascuna fascia temporale,
-    tutti recuperati in un'unica richiesta a Wikidata (una sotto-query per
-    fascia, unite con UNION) invece di una richiesta separata per fascia:
-    ogni richiesta di rete ha un costo fisso di latenza che si somma in
-    fretta se ripetuto 9 volte di fila.
-    """
-    occupations_values = " ".join(f"wd:{qid}" for qid in LITERARY_OCCUPATIONS)
-    era_blocks = []
-    for start_year, end_year, limit in ERA_BUCKETS:
-        era_blocks.append(f"""
-        {{
-          SELECT ?person WHERE {{
-            VALUES ?occupation {{ {occupations_values} }}
-            ?person wdt:P106 ?occupation .
-            ?person wdt:P569 ?dob .
-            FILTER(YEAR(?dob) >= {start_year} && YEAR(?dob) <= {end_year})
-            ?person wikibase:sitelinks ?sitelinks .
-            FILTER(?sitelinks > {MIN_SITELINKS_GENERAL})
-          }}
-          ORDER BY DESC(?sitelinks)
-          LIMIT {limit}
-        }}
-        """)
-
-    query = f"""
-    SELECT DISTINCT ?person WHERE {{
-      {" UNION ".join(era_blocks)}
-    }}
-    """
-    rows = _run_sparql(query)
-    return [
-        row["person"]["value"].rstrip("/").split("/")[-1]
-        for row in rows if row.get("person")
-    ]
-
-
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def get_general_authors_geo() -> list[dict]:
-    """Grandi autori della storia in generale, con coordinate di nascita/morte
-    e la/le correnti letterarie a cui sono associati (quando note su Wikidata).
-    Gli autori vengono scelti a piccoli gruppi per fascia temporale (vedi
-    ERA_BUCKETS), non con un'unica classifica globale, per avere una
-    distribuzione più equilibrata nel tempo."""
-    qids = sorted(set(_top_person_qids_all_eras()))
-    if not qids:
-        return []
-
-    values_clause = " ".join(f"wd:{qid}" for qid in qids)
-    query = f"""
-    SELECT DISTINCT ?person ?personLabel ?dob ?dobCoord ?dod ?dodCoord WHERE {{
-      VALUES ?person {{ {values_clause} }}
-      OPTIONAL {{
-        ?person wdt:P569 ?dob .
-        ?person wdt:P19 ?pob .
-        ?pob wdt:P625 ?dobCoord .
-      }}
-      OPTIONAL {{
-        ?person wdt:P570 ?dod .
-        ?person wdt:P20 ?pod .
-        ?pod wdt:P625 ?dodCoord .
-      }}
-      FILTER(BOUND(?dobCoord) || BOUND(?dodCoord))
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "it,en". }}
-    }}
     """
-    events = _rows_to_events(_run_sparql(query))
+    Grandi autori della storia in generale, letti dalla tabella
+    notable_authors (precaricata da populate_notable_authors.py) invece che
+    da Wikidata in tempo reale: molto più veloce da caricare.
+    """
+    supabase = get_supabase_client()
+    resp = supabase.table("notable_authors").select("*").execute()
 
-    person_urls = sorted({ev["url"] for ev in events if ev.get("url")})
-    movements_by_person = _get_movements_for_persons(person_urls)
-    for ev in events:
-        ev["movements"] = movements_by_person.get(ev["url"], [])
+    events = []
+    for row in resp.data:
+        movements = [m.strip() for m in (row.get("movements") or "").split(",") if m.strip()]
+
+        if row.get("birth_year") and row.get("birth_lat") is not None and row.get("birth_lon") is not None:
+            events.append({
+                "name": row["name"],
+                "event": "nascita",
+                "date": f"{row['birth_year']:04d}-01-01",
+                "lat": row["birth_lat"],
+                "lon": row["birth_lon"],
+                "url": row.get("wikipedia_url"),
+                "movements": movements,
+            })
+
+        if row.get("death_year") and row.get("death_lat") is not None and row.get("death_lon") is not None:
+            events.append({
+                "name": row["name"],
+                "event": "morte",
+                "date": f"{row['death_year']:04d}-01-01",
+                "lat": row["death_lat"],
+                "lon": row["death_lon"],
+                "url": row.get("wikipedia_url"),
+                "movements": movements,
+            })
 
     return events
-
-
-NO_MOVEMENT_LABEL = "Non specificata"
-
-
-def _get_movements_for_persons(person_urls: list[str]) -> dict[str, list[str]]:
-    """Recupera, per un elenco di persone Wikidata, le correnti/movimenti
-    letterari (proprietà P135) a cui sono associate. Restituisce un dizionario
-    url-persona -> lista di nomi di movimento (vuota se nessuno noto)."""
-    if not person_urls:
-        return {}
-
-    qids = [url.rstrip("/").split("/")[-1] for url in person_urls]
-    values_clause = " ".join(f"wd:{qid}" for qid in qids)
-
-    query = f"""
-    SELECT ?person (GROUP_CONCAT(DISTINCT ?movementLabel; separator="||") AS ?movements) WHERE {{
-      VALUES ?person {{ {values_clause} }}
-      OPTIONAL {{
-        ?person wdt:P135 ?movement .
-        ?movement rdfs:label ?movementLabel .
-        FILTER(LANG(?movementLabel) = "it")
-      }}
-    }}
-    GROUP BY ?person
-    """
-    rows = _run_sparql(query)
-
-    result = {}
-    for row in rows:
-        person_url = row.get("person", {}).get("value")
-        raw = row.get("movements", {}).get("value") or ""
-        movements = [m for m in raw.split("||") if m]
-        result[person_url] = movements
-    return result
 
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)

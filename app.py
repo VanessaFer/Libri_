@@ -1,5 +1,5 @@
 """
-Webapp Libri - con autenticazione, salvataggio reale su Supabase,
+Webapp Libri - con autenticazione, salvataggio DB su Supabase,
 gestione opere/edizioni separate e scheda libro dedicata.
 """
 
@@ -21,7 +21,7 @@ from library_db import (
     add_to_user_library, get_user_book_entry, get_user_books,
     get_user_opinion, save_opinion, get_average_rating,
     split_authors, get_authors_for_work, link_authors_to_work,
-    create_note, get_notes_for_book, delete_note,
+    create_note, get_notes_for_book, update_note, delete_note,
     get_existing_titles, get_existing_authors, get_existing_publishers,
     get_user_tags, get_tags_for_work, add_tag_to_work, remove_tag_from_work, get_user_work_tags_map,
     rename_tag, delete_tag, import_wizard_save_candidate,
@@ -289,13 +289,14 @@ def render_book_detail(book_id: str):
                 widget_key = f"detail_pagesread_{book_id}"
 
                 # Inizializzo lo stato del widget solo se non esiste ancora
-                # per questa sessione, altrimenti Streamlit ignorerebbe il
-                # valore calcolato qui sotto e terrebbe quello precedente.
-                if widget_key not in st.session_state:
-                    if new_status == "letto" and not current_pages_read:
-                        # Non hai mai specificato pagine lette per un libro
-                        # già segnato come letto: presumiamo l'abbia letto
-                        # tutto (utile per l'import di libri letti in passato).
+                # per questa sessione (altrimenti Streamlit ignorerebbe il
+                # valore calcolato qui sotto e terrebbe quello precedente),
+                # OPPURE ogni volta che lo stato passa a "letto" in questo
+                # momento: in tal caso portiamo le pagine lette al totale,
+                # anche se erano già state impostate a un valore parziale.
+                just_marked_as_letto = new_status == "letto" and current_status != "letto"
+                if widget_key not in st.session_state or just_marked_as_letto:
+                    if just_marked_as_letto:
                         st.session_state[widget_key] = total_pages
                     else:
                         st.session_state[widget_key] = min(current_pages_read or 0, total_pages)
@@ -333,16 +334,54 @@ def render_book_detail(book_id: str):
 
     notes = get_notes_for_book(user["id"], book_id)
     for note in notes:
+        editing_key = f"editing_note_{note['id']}"
         with st.container(border=True):
-            if note.get("page_or_location"):
-                st.caption(f"📍 {note['page_or_location']}")
-            if note.get("quote_text"):
-                st.markdown(f"> {note['quote_text']}")
-            if note.get("comment"):
-                st.write(note["comment"])
-            if st.button("🗑️ Elimina", key=f"delete_note_{note['id']}"):
-                if delete_note(note["id"]):
-                    st.rerun()
+            if st.session_state.get(editing_key):
+                with st.form(key=f"edit_note_form_{note['id']}"):
+                    edit_page = st.text_input(
+                        "Pagina o posizione (opzionale)", value=note.get("page_or_location") or "",
+                        key=f"edit_page_{note['id']}",
+                    )
+                    edit_quote = st.text_area(
+                        "Citazione (opzionale)", value=note.get("quote_text") or "", height=80,
+                        key=f"edit_quote_{note['id']}",
+                    )
+                    edit_comment = st.text_area(
+                        "Il tuo commento (opzionale)", value=note.get("comment") or "", height=80,
+                        key=f"edit_comment_{note['id']}",
+                    )
+                    col_save, col_cancel = st.columns(2)
+                    with col_save:
+                        save_clicked = st.form_submit_button("💾 Salva modifiche", use_container_width=True)
+                    with col_cancel:
+                        cancel_clicked = st.form_submit_button("Annulla", use_container_width=True)
+
+                    if save_clicked:
+                        if not edit_page.strip() and not edit_quote.strip() and not edit_comment.strip():
+                            st.error("Compila almeno un campo.")
+                        else:
+                            if update_note(note["id"], edit_quote.strip() or None, edit_page.strip() or None, edit_comment.strip() or None):
+                                st.session_state[editing_key] = False
+                                st.rerun()
+                    if cancel_clicked:
+                        st.session_state[editing_key] = False
+                        st.rerun()
+            else:
+                if note.get("page_or_location"):
+                    st.caption(f"📍 {note['page_or_location']}")
+                if note.get("quote_text"):
+                    st.markdown(f"> {note['quote_text']}")
+                if note.get("comment"):
+                    st.write(note["comment"])
+                col_edit, col_delete = st.columns(2)
+                with col_edit:
+                    if st.button("✏️ Modifica", key=f"start_edit_note_{note['id']}", use_container_width=True):
+                        st.session_state[editing_key] = True
+                        st.rerun()
+                with col_delete:
+                    if st.button("🗑️ Elimina", key=f"delete_note_{note['id']}", use_container_width=True):
+                        if delete_note(note["id"]):
+                            st.rerun()
 
     with st.expander("➕ Aggiungi un'annotazione"):
         with st.form(key=f"new_note_{book_id}", clear_on_submit=True):

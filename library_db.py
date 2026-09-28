@@ -415,6 +415,20 @@ def get_notes_for_book(user_id: str, book_id: str) -> list[dict]:
     return result.data
 
 
+def update_note(note_id: str, quote_text: str = None, page_or_location: str = None, comment: str = None) -> bool:
+    supabase = get_supabase_client()
+    try:
+        supabase.table("notes").update({
+            "quote_text": quote_text or None,
+            "page_or_location": page_or_location or None,
+            "comment": comment or None,
+        }).eq("id", note_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Errore durante la modifica: {e}")
+        return False
+
+
 def delete_note(note_id: str) -> bool:
     supabase = get_supabase_client()
     try:
