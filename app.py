@@ -97,7 +97,7 @@ def _render_letto_extras(key_prefix: str, user_id: str) -> dict:
     dopo che l'opera è stata risolta (vedi _apply_letto_extras), perché al
     momento della scelta il work_id potrebbe non essere ancora certo.
     """
-    with st.expander("⭐ Vota e tagga subito (opzionale)", expanded=True):
+    with st.expander("⭐ Vota e tagga subito (opzionale)", expanded=False):
         rating = book_rating_input(key=f"{key_prefix}_rating", default=0)
 
         recommended_label = st.radio(
