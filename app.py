@@ -89,6 +89,48 @@ def _default_pages_read_for_status(status: str, book: dict):
     return _NOT_PROVIDED
 
 
+def _render_letto_extras(key_prefix: str, user_id: str) -> dict:
+    """
+    Se il libro viene aggiunto già come 'Letto', permette di impostare da
+    subito voto, consigliato, commento e tag - senza dover riaprire la
+    scheda dopo per farlo. I valori raccolti qui vengono applicati solo
+    dopo che l'opera è stata risolta (vedi _apply_letto_extras), perché al
+    momento della scelta il work_id potrebbe non essere ancora certo.
+    """
+    with st.expander("⭐ Vota e tagga subito (opzionale)", expanded=True):
+        rating = book_rating_input(key=f"{key_prefix}_rating", default=0)
+
+        recommended_label = st.radio(
+            "Lo consiglieresti?", ["Non esprimersi", "Sì", "No"],
+            index=0, horizontal=True, key=f"{key_prefix}_recommended",
+        )
+        recommended_value = {"Sì": True, "No": False, "Non esprimersi": None}[recommended_label]
+
+        comment = st.text_area("Commento (opzionale)", key=f"{key_prefix}_comment", height=80)
+
+        tags_input = st.text_input(
+            "Tag (opzionale, separati da virgola se più di uno)",
+            key=f"{key_prefix}_tags", placeholder="es. saggistica, storia medievale",
+        )
+
+    return {
+        "rating": rating or None,
+        "recommended": recommended_value,
+        "comment": comment.strip() or None,
+        "tag_names": [t.strip() for t in tags_input.split(",") if t.strip()],
+    }
+
+
+def _apply_letto_extras(user_id: str, work_id: str, extras: dict | None):
+    """Applica all'opera appena risolta voto/opinione/tag raccolti da _render_letto_extras."""
+    if not extras or not work_id:
+        return
+    if extras.get("rating") or extras.get("recommended") is not None or extras.get("comment"):
+        save_opinion(user_id, work_id, extras.get("rating"), extras.get("recommended"), extras.get("comment"))
+    for tag_name in extras.get("tag_names") or []:
+        add_tag_to_work(user_id, work_id, tag_name=tag_name)
+
+
 # ---------------------------------------------------------------------------
 # Flusso di salvataggio con risoluzione dell'opera (con conferma se ambigua)
 # ---------------------------------------------------------------------------
@@ -116,7 +158,7 @@ def _authors_display_for_book(book: dict) -> str:
     return book.get("author") or "Autore N/D"
 
 
-def start_add_flow(book: dict, status: str):
+def start_add_flow(book: dict, status: str, letto_extras: dict | None = None):
     """
     Cerca opere simili per titolo. Se non trova nulla, crea direttamente
     una nuova opera e salva. Se trova candidati, chiede conferma prima
@@ -132,9 +174,12 @@ def start_add_flow(book: dict, status: str):
         )
         if book_id:
             st.session_state["last_added_book_id"] = book_id
+            _apply_letto_extras(user["id"], work_id, letto_extras)
             st.success(f"'{book['title']}' salvato nella tua libreria!")
     else:
-        st.session_state["pending_add"] = {"book": book, "status": status, "candidates": similar}
+        st.session_state["pending_add"] = {
+            "book": book, "status": status, "candidates": similar, "letto_extras": letto_extras,
+        }
         st.rerun()
 
 
@@ -171,6 +216,7 @@ def render_pending_add_confirmation():
             )
             if book_id:
                 st.session_state["last_added_book_id"] = book_id
+                _apply_letto_extras(user["id"], work_id, pending.get("letto_extras"))
                 st.success(f"'{pending['book']['title']}' salvato nella tua libreria!")
             del st.session_state["pending_add"]
             st.rerun()
@@ -527,6 +573,10 @@ def manual_entry_form(default_title: str = "", key_prefix: str = "manual"):
     )
     status_value = STATUS_OPTIONS[status_label]
 
+    letto_extras = None
+    if status_value == "letto":
+        letto_extras = _render_letto_extras(key_prefix=f"{key_prefix}_letto", user_id=user["id"])
+
     # Fuori dal form, così il numero di campi autore si aggiorna subito
     # quando cambi il numero, senza aspettare l'invio
     num_authors = st.number_input(
@@ -603,7 +653,7 @@ def manual_entry_form(default_title: str = "", key_prefix: str = "manual"):
                 "source_api": "manuale",
                 "external_id": None,
             }
-            start_add_flow(book, status_value)
+            start_add_flow(book, status_value, letto_extras)
             return True
     return False
 
@@ -1551,6 +1601,10 @@ def render_search_and_add():
                     st.markdown(f"**{cb.get('title')}**")
                     st.caption(f"{cb.get('author') or 'Autore N/D'} · {cb.get('publisher') or 'editore N/D'} · {cb.get('year') or 'anno N/D'}")
                     status = status_selector(key_prefix=f"catalog_{cb['id']}")
+                    catalog_letto_extras = (
+                        _render_letto_extras(key_prefix=f"catalog_{cb['id']}_letto", user_id=user["id"])
+                        if status == "letto" else None
+                    )
                     col_add, col_open = st.columns(2)
                     with col_add:
                         if st.button("Aggiungi alla libreria", key=f"addlib_catalog_{cb['id']}"):
@@ -1558,6 +1612,7 @@ def render_search_and_add():
                                 user["id"], cb["id"], status,
                                 pages_read=_default_pages_read_for_status(status, cb),
                             ):
+                                _apply_letto_extras(user["id"], cb.get("work_id"), catalog_letto_extras)
                                 st.success(f"'{cb['title']}' salvato nella tua libreria!")
                     with col_open:
                         if st.button("📖 Apri scheda", key=f"catalog_open_{cb['id']}"):
@@ -1612,17 +1667,65 @@ def render_search_and_add():
                         key=f"pagecount_input_{i}",
                     )
 
+                    default_result_authors = split_authors(book.get("author"))
+                    with st.expander("✏️ Correggi altri dettagli prima di salvare (opzionale)"):
+                        existing_authors_for_result = get_existing_authors()
+                        num_result_authors = st.number_input(
+                            "Quanti autori ha?", min_value=1, max_value=6,
+                            value=len(default_result_authors) or 1, step=1,
+                            key=f"result_{i}_num_authors",
+                        )
+                        result_author_keys = []
+                        for a_i in range(int(num_result_authors)):
+                            author_key = f"result_{i}_author_{a_i}"
+                            default_name = default_result_authors[a_i] if a_i < len(default_result_authors) else ""
+                            _init_field_default(author_key, default_name)
+                            label = (
+                                "Autore già presente? (opzionale)" if num_result_authors == 1
+                                else f"Autore {a_i + 1} già presente? (opzionale)"
+                            )
+                            _suggestion_picker(label, existing_authors_for_result, author_key, f"result_{i}_authorpicker_{a_i}")
+                            result_author_keys.append(author_key)
+
+                        result_author_inputs = [
+                            st.text_input(
+                                "Nome autore" if num_result_authors == 1 else f"Nome autore {a_i + 1}",
+                                key=result_author_keys[a_i],
+                            )
+                            for a_i in range(int(num_result_authors))
+                        ]
+
+                        publisher_override = st.text_input(
+                            "Casa editrice", value=book.get("publisher") or "", key=f"result_{i}_publisher",
+                        )
+                        year_override = st.text_input(
+                            "Anno di pubblicazione", value=book.get("year") or "", key=f"result_{i}_year",
+                        )
+                        isbn_override = st.text_input(
+                            "ISBN", value=book.get("isbn") or "", key=f"result_{i}_isbn",
+                        )
+
                     status = status_selector(key_prefix=f"result_{i}")
+                    letto_extras = (
+                        _render_letto_extras(key_prefix=f"result_{i}_letto", user_id=user["id"])
+                        if status == "letto" else None
+                    )
 
                     if st.button("Aggiungi alla libreria", key=f"addlib_result_{i}"):
                         final_cover = st.session_state.get(cover_key) or book.get("cover_url")
                         final_synopsis = book.get("synopsis") or manual_synopsis.strip() or None
                         final_page_count = int(page_count_input) or None
+                        final_authors = [a.strip() for a in result_author_inputs if a.strip()]
                         book_to_save = {
                             **book, "cover_url": final_cover, "synopsis": final_synopsis,
                             "page_count": final_page_count,
+                            "author": ", ".join(final_authors) or None,
+                            "authors_list": final_authors,
+                            "publisher": publisher_override.strip() or None,
+                            "year": year_override.strip() or None,
+                            "isbn": isbn_override.strip() or None,
                         }
-                        start_add_flow(book_to_save, status)
+                        start_add_flow(book_to_save, status, letto_extras)
                 st.divider()
 
             st.caption("Nessuno di questi corrisponde a quello che cerchi?")
