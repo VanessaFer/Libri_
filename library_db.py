@@ -97,6 +97,39 @@ def get_authors_for_work(work_id: str) -> list[dict]:
     return [r["authors"] for r in result.data if r.get("authors")]
 
 
+def unlink_author_from_work(work_id: str, author_id: str) -> bool:
+    """Scollega un autore da un'opera (non elimina l'autore, solo il collegamento work_authors)."""
+    supabase = get_supabase_client()
+    try:
+        supabase.table("work_authors").delete().eq("work_id", work_id).eq("author_id", author_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Errore durante la rimozione dell'autore: {e}")
+        return False
+
+
+def sync_work_authors(work_id: str, author_names: list[str]) -> bool:
+    """
+    Sostituisce gli autori collegati a un'opera con esattamente quelli indicati:
+    rimuove i collegamenti non più presenti nella lista e aggiunge quelli nuovi
+    (il confronto ignora maiuscole/minuscole). Usata per mantenere sincronizzato
+    il testo libero 'Autore' di un'edizione con gli autori canonici dell'opera,
+    così correggere il campo in alto nel pannello admin aggiorna anche la
+    visualizzazione nella libreria (che si basa su work_authors).
+    """
+    desired = [n.strip() for n in author_names if n and n.strip()]
+    desired_lower = {n.lower() for n in desired}
+
+    current = get_authors_for_work(work_id)
+    for a in current:
+        if a["name"].lower() not in desired_lower:
+            unlink_author_from_work(work_id, a["id"])
+
+    if desired:
+        link_authors_to_work(work_id, desired)
+    return True
+
+
 def create_work(title: str, author_names: list[str] = None) -> str:
     """
     Crea una nuova opera. `author_names` è una lista di nomi (uno per
@@ -703,12 +736,13 @@ def get_existing_publishers(limit: int = 500) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def save_book_with_status(
-    book: dict, work_id: str, user_id: str, status: str, auto_approve: bool = False, formato=_NOT_PROVIDED
+    book: dict, work_id: str, user_id: str, status: str, auto_approve: bool = False,
+    formato=_NOT_PROVIDED, pages_read=_NOT_PROVIDED,
 ) -> str | None:
     """Crea/riusa l'edizione (collegata al work_id dato) e la associa all'utente. Restituisce il book_id."""
     try:
         book_id = upsert_book(book, work_id, auto_approve)
-        ok = add_to_user_library(user_id, book_id, status, formato=formato)
+        ok = add_to_user_library(user_id, book_id, status, formato=formato, pages_read=pages_read)
         return book_id if ok else None
     except Exception as e:
         st.error(f"Errore durante il salvataggio del libro: {e}")

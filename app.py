@@ -15,12 +15,12 @@ from authors_map import get_general_authors_geo, build_timeline_map, NO_MOVEMENT
 from reading_lists import get_reading_lists, get_reading_list_items, get_reading_list_progress
 from auth import require_login, get_current_user, sign_out
 from library_db import (
-    save_book_with_status, get_username,
+    save_book_with_status, get_username, _NOT_PROVIDED,
     find_similar_works, create_work, get_work,
     get_book, get_editions_for_work, search_catalog_books, set_book_cover, set_book_page_count,
     add_to_user_library, get_user_book_entry, get_user_books,
     get_user_opinion, save_opinion, get_average_rating,
-    split_authors, get_authors_for_work, link_authors_to_work,
+    split_authors, get_authors_for_work, link_authors_to_work, unlink_author_from_work, sync_work_authors,
     create_note, get_notes_for_book, update_note, delete_note,
     get_existing_titles, get_existing_authors, get_existing_publishers,
     get_user_tags, get_tags_for_work, add_tag_to_work, remove_tag_from_work, get_user_work_tags_map,
@@ -78,6 +78,17 @@ def _default_formato_for_status(status: str):
     return "cartaceo" if status in FORMATO_RELEVANT_STATUSES else None
 
 
+def _default_pages_read_for_status(status: str, book: dict):
+    """
+    Se il libro viene aggiunto già segnato come 'letto' e conosciamo il
+    numero di pagine, segna in automatico tutte le pagine come lette
+    (altrimenti lascia il campo non impostato, come prima).
+    """
+    if status == "letto" and book.get("page_count"):
+        return book["page_count"]
+    return _NOT_PROVIDED
+
+
 # ---------------------------------------------------------------------------
 # Flusso di salvataggio con risoluzione dell'opera (con conferma se ambigua)
 # ---------------------------------------------------------------------------
@@ -85,6 +96,24 @@ def _default_formato_for_status(status: str):
 def _resolve_author_names(book: dict) -> list[str]:
     """Preferisce la lista strutturata (authors_list) se presente, altrimenti scompone la stringa 'author'."""
     return book.get("authors_list") or split_authors(book.get("author"))
+
+
+@st.cache_data(ttl=120)
+def _get_authors_for_work_cached(work_id: str) -> list[dict]:
+    return get_authors_for_work(work_id)
+
+
+def _authors_display_for_book(book: dict) -> str:
+    """
+    Nome/i autore da mostrare per un'edizione: preferisce gli autori collegati
+    all'opera (work_authors, la fonte sempre aggiornata quando se ne aggiungono
+    o rimuovono dal pannello admin), altrimenti il testo libero dell'edizione.
+    """
+    if book.get("work_id"):
+        linked_authors = _get_authors_for_work_cached(book["work_id"])
+        if linked_authors:
+            return ", ".join(a["name"] for a in linked_authors)
+    return book.get("author") or "Autore N/D"
 
 
 def start_add_flow(book: dict, status: str):
@@ -99,6 +128,7 @@ def start_add_flow(book: dict, status: str):
         book_id = save_book_with_status(
             book, work_id, user["id"], status, auto_approve=user_is_admin,
             formato=_default_formato_for_status(status),
+            pages_read=_default_pages_read_for_status(status, book),
         )
         if book_id:
             st.session_state["last_added_book_id"] = book_id
@@ -137,6 +167,7 @@ def render_pending_add_confirmation():
             book_id = save_book_with_status(
                 pending["book"], work_id, user["id"], pending["status"], auto_approve=user_is_admin,
                 formato=_default_formato_for_status(pending["status"]),
+                pages_read=_default_pages_read_for_status(pending["status"], pending["book"]),
             )
             if book_id:
                 st.session_state["last_added_book_id"] = book_id
@@ -229,11 +260,7 @@ def render_book_detail(book_id: str):
     with col2:
         st.title(book.get("title", "Titolo sconosciuto"))
 
-        authors_display = book.get("author") or "Autore N/D"
-        if work:
-            linked_authors = get_authors_for_work(work["id"])
-            if linked_authors:
-                authors_display = ", ".join(a["name"] for a in linked_authors)
+        authors_display = _authors_display_for_book(book)
 
         st.caption(
             f"{authors_display} · "
@@ -662,12 +689,13 @@ def render_admin_panel():
                 st.write(f"ID: `{b['id']}`")
                 new_title = st.text_input("Titolo", value=b.get("title") or "", key=f"admin_title_{b['id']}")
                 new_author = st.text_input(
-                    "Autore (testo visualizzato per questa edizione)",
+                    "Autore (separati da virgola se più di uno)",
                     value=b.get("author") or "", key=f"admin_author_{b['id']}",
                 )
                 st.caption(
-                    "⚠️ Questo campo cambia solo il testo mostrato per questa edizione, "
-                    "non il collegamento agli autori dell'opera (work_authors)."
+                    "ℹ️ Salvando, questo campo sostituisce anche gli autori collegati "
+                    "all'opera (mostrati più sotto) — usa il campo qui sopra per correggerli "
+                    "in blocco, oppure l'elenco sotto per aggiungerne/rimuoverne uno singolo."
                 )
                 col1, col2 = st.columns(2)
                 with col1:
@@ -696,12 +724,88 @@ def render_admin_panel():
                             "page_count": int(new_page_count) or None,
                         }
                         if update_book(b["id"], updates):
+                            if b.get("work_id"):
+                                sync_work_authors(b["work_id"], split_authors(new_author))
+                                _get_authors_for_work_cached.clear()
                             st.success("Aggiornato.")
                             st.rerun()
                 with col_delete:
                     if st.form_submit_button("🗑️ Elimina libro"):
                         if delete_book(b["id"]):
                             st.success("Eliminato.")
+                            st.rerun()
+
+            with st.expander("👤 Autori collegati a quest'opera"):
+                work_id = b.get("work_id")
+                if not work_id:
+                    st.caption(
+                        "Questa edizione non è ancora collegata a un'opera: senza opera "
+                        "non è possibile gestire gli autori collegati (work_authors)."
+                    )
+                    if st.button("Crea opera per questo libro", key=f"admin_creatework_{b['id']}"):
+                        initial_authors = split_authors(b.get("author"))
+                        new_work_id = create_work(b.get("title") or "Senza titolo", initial_authors)
+                        if update_book(b["id"], {"work_id": new_work_id}):
+                            st.success("Opera creata e collegata a questa edizione.")
+                            st.rerun()
+                else:
+                    linked_authors = get_authors_for_work(work_id)
+                    if not linked_authors:
+                        st.caption("Nessun autore ancora collegato a quest'opera.")
+                    else:
+                        for a in linked_authors:
+                            col_name, col_remove = st.columns([4, 1])
+                            with col_name:
+                                st.write(f"- {a['name']}")
+                            with col_remove:
+                                if st.button("🗑️", key=f"admin_unlinkauthor_{b['id']}_{a['id']}"):
+                                    if unlink_author_from_work(work_id, a["id"]):
+                                        _get_authors_for_work_cached.clear()
+                                        remaining = [x["name"] for x in linked_authors if x["id"] != a["id"]]
+                                        update_book(b["id"], {"author": ", ".join(remaining) or None})
+                                        st.success(f"Rimosso «{a['name']}».")
+                                        st.rerun()
+
+                    st.markdown("**Aggiungi nuovo/i autore/i**")
+                    add_prefix = f"admin_addauthor_{b['id']}"
+                    num_new_authors = st.number_input(
+                        "Quanti autori vuoi aggiungere?",
+                        min_value=1, max_value=6, value=1, step=1,
+                        key=f"{add_prefix}_num",
+                    )
+
+                    existing_authors = get_existing_authors()
+                    new_author_keys = []
+                    for i in range(int(num_new_authors)):
+                        author_key = f"{add_prefix}_name_{i}"
+                        _init_field_default(author_key, "")
+                        label = "Autore già presente? (opzionale)" if num_new_authors == 1 else f"Autore {i + 1} già presente? (opzionale)"
+                        _suggestion_picker(label, existing_authors, author_key, f"{add_prefix}_picker_{i}")
+                        new_author_keys.append(author_key)
+
+                    new_author_inputs = []
+                    for i in range(int(num_new_authors)):
+                        label = "Nome nuovo autore" if num_new_authors == 1 else f"Nome autore {i + 1}"
+                        new_author_inputs.append(st.text_input(label, key=new_author_keys[i]))
+
+                    if st.button("➕ Aggiungi autore/i", key=f"{add_prefix}_btn"):
+                        new_names = [n.strip() for n in new_author_inputs if n and n.strip()]
+                        if not new_names:
+                            st.warning("Inserisci almeno un nome.")
+                        else:
+                            link_authors_to_work(work_id, new_names)
+                            get_existing_authors.clear()
+                            _get_authors_for_work_cached.clear()
+                            all_names = [a["name"] for a in get_authors_for_work(work_id)]
+                            update_book(b["id"], {"author": ", ".join(all_names) or None})
+                            # svuota i campi appena usati, così al prossimo utilizzo
+                            # non restano precompilati con i nomi appena aggiunti
+                            for i, author_key in enumerate(new_author_keys):
+                                st.session_state.pop(author_key, None)
+                                st.session_state.pop(f"{add_prefix}_picker_{i}", None)
+                                st.session_state.pop(f"{add_prefix}_picker_{i}_last", None)
+                            st.session_state.pop(f"{add_prefix}_num", None)
+                            st.success("Autore/i aggiunto/i.")
                             st.rerun()
             st.divider()
 
@@ -919,7 +1023,7 @@ def render_my_library():
 
         for entry in entries:
             book = entry.get("books") or {}
-            author = book.get("author") or "Autore N/D"
+            author = _authors_display_for_book(book)
             st.write(f"**{book.get('title', 'Titolo sconosciuto')}** — {author}")
 
         return
@@ -937,7 +1041,7 @@ def render_my_library():
 
                 st.markdown(f"**{book.get('title', 'Titolo sconosciuto')}**")
                 status_label = STATUS_BADGE_LABELS.get(entry.get("status"), entry.get("status"))
-                st.caption(book.get("author") or "Autore N/D")
+                st.caption(_authors_display_for_book(book))
 
                 badges_html = status_badge(status_label)
                 formato_label = FORMATO_LABELS.get(entry.get("formato"))
@@ -1303,116 +1407,127 @@ def _render_recommendation_card(book: dict, index: int, key_prefix: str):
 
 def render_esplora():
     page_heading(SEARCH_SVG, "Esplora")
-    col_caption, col_refresh = st.columns([5, 1])
-    with col_caption:
-        st.caption("Consigli di lettura e uno sguardo geografico/storico sugli autori.")
-    with col_refresh:
-        if st.button("🔄 Aggiorna consigli", key="refresh_esplora"):
-            get_recommendations.clear()
-            st.rerun()
+    st.caption("Liste di lettura curate, con il tuo progresso di lettura.")
 
-    tab_amati, tab_letti, tab_mappa, tab_liste = st.tabs(
-        ["Nei tuoi gusti", "Dal tuo scaffale", "Mappa degli autori", "Liste di lettura"]
-    )
+    # --- SEZIONI DISATTIVATE (10/2026) ---
+    # "Nei tuoi gusti" e "Dal tuo scaffale" sono troppo lente per l'uso quotidiano;
+    # la "Mappa degli autori" verrà ripopolata manualmente su Supabase dall'utente.
+    # Codice mantenuto qui, commentato, per una eventuale riattivazione futura.
+    #
+    # col_caption, col_refresh = st.columns([5, 1])
+    # with col_caption:
+    #     st.caption("Consigli di lettura e uno sguardo geografico/storico sugli autori.")
+    # with col_refresh:
+    #     if st.button("🔄 Aggiorna consigli", key="refresh_esplora"):
+    #         get_recommendations.clear()
+    #         st.rerun()
+    #
+    # tab_amati, tab_letti, tab_mappa, tab_liste = st.tabs(
+    #     ["Nei tuoi gusti", "Dal tuo scaffale", "Mappa degli autori", "Liste di lettura"]
+    # )
+    #
+    # with tab_amati:
+    #     with st.spinner("Cerco suggerimenti tra i libri che hai amato di più..."):
+    #         amati = get_recommendations(user["id"], mode="amati")
+    #     if not amati:
+    #         st.info(
+    #             "Non ho trovato abbastanza libri valutati con 4-5 stelle e con tag/autore "
+    #             "associati per generare suggerimenti qui. Vota o taggare qualche libro in più."
+    #         )
+    #     else:
+    #         for i, book in enumerate(amati):
+    #             _render_recommendation_card(book, i, key_prefix="esplora_amati")
+    #
+    # with tab_letti:
+    #     with st.spinner("Cerco suggerimenti tra tutto quello che hai letto..."):
+    #         letti = get_recommendations(user["id"], mode="letti")
+    #     if not letti:
+    #         st.info(
+    #             "Non ho trovato abbastanza libri letti e taggati/con autore per generare "
+    #             "suggerimenti qui. Segna qualche libro come letto e aggiungi tag/autori."
+    #         )
+    #     else:
+    #         for i, book in enumerate(letti):
+    #             _render_recommendation_card(book, i, key_prefix="esplora_letti")
+    #
+    # with tab_mappa:
+    #     st.caption(
+    #         "Luoghi di nascita e morte dei grandi autori della storia, con uno slider per "
+    #         "vedere come si spostano nel tempo. Dati da Wikidata, aggiornati una volta al giorno."
+    #     )
+    #
+    #     with st.spinner("Carico i grandi autori della storia da Wikidata..."):
+    #         map_events = get_general_authors_geo()
+    #
+    #     if not map_events:
+    #         st.info("Nessun dato geografico disponibile al momento per generare la mappa.")
+    #     else:
+    #         all_movements = sorted({
+    #             m for ev in map_events for m in (ev.get("movements") or [NO_MOVEMENT_LABEL])
+    #         })
+    #         selected_movements = st.multiselect(
+    #             "Filtra per corrente letteraria",
+    #             options=all_movements,
+    #             default=[],
+    #             help="Nessuna selezione = mostra tutti gli autori.",
+    #         )
+    #
+    #         if selected_movements:
+    #             filtered_events = [
+    #                 ev for ev in map_events
+    #                 if set(ev.get("movements") or [NO_MOVEMENT_LABEL]) & set(selected_movements)
+    #             ]
+    #         else:
+    #             filtered_events = map_events
+    #
+    #         if not filtered_events:
+    #             st.info("Nessun autore corrisponde ai filtri selezionati.")
+    #         else:
+    #             fmap = build_timeline_map(filtered_events)
+    #             st_folium(fmap, width=None, height=520, key="authors_map_general")
+    #
+    # with tab_liste:
+    #     st.caption(
+    #         "Liste di libri curate da altri (BBC, Le Monde, 1001 libri da leggere nella "
+    #         "vita), con lo stato di lettura calcolato automaticamente in base a cosa hai "
+    #         "già segnato come letto nella tua libreria."
+    #     )
+    #
+    #     reading_lists = get_reading_lists()
+    #     ...
+    # --- FINE SEZIONI DISATTIVATE ---
 
-    with tab_amati:
-        with st.spinner("Cerco suggerimenti tra i libri che hai amato di più..."):
-            amati = get_recommendations(user["id"], mode="amati")
-        if not amati:
-            st.info(
-                "Non ho trovato abbastanza libri valutati con 4-5 stelle e con tag/autore "
-                "associati per generare suggerimenti qui. Vota o taggare qualche libro in più."
-            )
-        else:
-            for i, book in enumerate(amati):
-                _render_recommendation_card(book, i, key_prefix="esplora_amati")
+    reading_lists = get_reading_lists()
+    if not reading_lists:
+        st.info("Nessuna lista di lettura disponibile al momento.")
+    else:
+        for reading_list in reading_lists:
+            items = get_reading_list_items(reading_list["id"])
+            with st.spinner(f"Calcolo i libri letti in \"{reading_list['name']}\"..."):
+                progress = get_reading_list_progress(user["id"], reading_list["id"], items=items)
 
-    with tab_letti:
-        with st.spinner("Cerco suggerimenti tra tutto quello che hai letto..."):
-            letti = get_recommendations(user["id"], mode="letti")
-        if not letti:
-            st.info(
-                "Non ho trovato abbastanza libri letti e taggati/con autore per generare "
-                "suggerimenti qui. Segna qualche libro come letto e aggiungi tag/autori."
-            )
-        else:
-            for i, book in enumerate(letti):
-                _render_recommendation_card(book, i, key_prefix="esplora_letti")
+            st.markdown(f"#### {reading_list['name']}")
+            if reading_list.get("description"):
+                st.caption(reading_list["description"])
 
-    with tab_mappa:
-        st.caption(
-            "Luoghi di nascita e morte dei grandi autori della storia, con uno slider per "
-            "vedere come si spostano nel tempo. Dati da Wikidata, aggiornati una volta al giorno."
-        )
+            total = progress["total"]
+            read_count = progress["read_count"]
+            st.progress(read_count / total if total else 0)
+            st.write(f"**{read_count} / {total}** libri letti")
 
-        with st.spinner("Carico i grandi autori della storia da Wikidata..."):
-            map_events = get_general_authors_geo()
+            with st.expander("Vedi tutti i libri della lista"):
+                sections = {}
+                for item in progress["items"]:
+                    sections.setdefault(item.get("section"), []).append(item)
 
-        if not map_events:
-            st.info("Nessun dato geografico disponibile al momento per generare la mappa.")
-        else:
-            all_movements = sorted({
-                m for ev in map_events for m in (ev.get("movements") or [NO_MOVEMENT_LABEL])
-            })
-            selected_movements = st.multiselect(
-                "Filtra per corrente letteraria",
-                options=all_movements,
-                default=[],
-                help="Nessuna selezione = mostra tutti gli autori.",
-            )
-
-            if selected_movements:
-                filtered_events = [
-                    ev for ev in map_events
-                    if set(ev.get("movements") or [NO_MOVEMENT_LABEL]) & set(selected_movements)
-                ]
-            else:
-                filtered_events = map_events
-
-            if not filtered_events:
-                st.info("Nessun autore corrisponde ai filtri selezionati.")
-            else:
-                fmap = build_timeline_map(filtered_events)
-                st_folium(fmap, width=None, height=520, key="authors_map_general")
-
-    with tab_liste:
-        st.caption(
-            "Liste di libri curate da altri (BBC, Le Monde, 1001 libri da leggere nella "
-            "vita), con lo stato di lettura calcolato automaticamente in base a cosa hai "
-            "già segnato come letto nella tua libreria."
-        )
-
-        reading_lists = get_reading_lists()
-        if not reading_lists:
-            st.info("Nessuna lista di lettura disponibile al momento.")
-        else:
-            for reading_list in reading_lists:
-                items = get_reading_list_items(reading_list["id"])
-                with st.spinner(f"Calcolo i libri letti in \"{reading_list['name']}\"..."):
-                    progress = get_reading_list_progress(user["id"], reading_list["id"], items=items)
-
-                st.markdown(f"#### {reading_list['name']}")
-                if reading_list.get("description"):
-                    st.caption(reading_list["description"])
-
-                total = progress["total"]
-                read_count = progress["read_count"]
-                st.progress(read_count / total if total else 0)
-                st.write(f"**{read_count} / {total}** libri letti")
-
-                with st.expander("Vedi tutti i libri della lista"):
-                    sections = {}
-                    for item in progress["items"]:
-                        sections.setdefault(item.get("section"), []).append(item)
-
-                    for section, section_items in sections.items():
-                        if section:
-                            st.markdown(f"**{section}**")
-                        rows = [
-                            f"{'✅' if item['read'] else '⬜'} {item['title']} — *{item.get('author') or 'N/D'}*"
-                            for item in section_items
-                        ]
-                        st.markdown("\n\n".join(rows))
+                for section, section_items in sections.items():
+                    if section:
+                        st.markdown(f"**{section}**")
+                    rows = [
+                        f"{'✅' if item['read'] else '⬜'} {item['title']} — *{item.get('author') or 'N/D'}*"
+                        for item in section_items
+                    ]
+                    st.markdown("\n\n".join(rows))
 
                 st.divider()
 
@@ -1439,7 +1554,10 @@ def render_search_and_add():
                     col_add, col_open = st.columns(2)
                     with col_add:
                         if st.button("Aggiungi alla libreria", key=f"addlib_catalog_{cb['id']}"):
-                            if add_to_user_library(user["id"], cb["id"], status):
+                            if add_to_user_library(
+                                user["id"], cb["id"], status,
+                                pages_read=_default_pages_read_for_status(status, cb),
+                            ):
                                 st.success(f"'{cb['title']}' salvato nella tua libreria!")
                     with col_open:
                         if st.button("📖 Apri scheda", key=f"catalog_open_{cb['id']}"):
@@ -1488,12 +1606,22 @@ def render_search_and_add():
                             key=f"synopsis_input_{i}", height=80,
                         )
 
+                    page_count_input = st.number_input(
+                        "Numero di pagine (opzionale, lascia 0 se non lo conosci)",
+                        min_value=0, step=1, value=int(book.get("page_count") or 0),
+                        key=f"pagecount_input_{i}",
+                    )
+
                     status = status_selector(key_prefix=f"result_{i}")
 
                     if st.button("Aggiungi alla libreria", key=f"addlib_result_{i}"):
                         final_cover = st.session_state.get(cover_key) or book.get("cover_url")
                         final_synopsis = book.get("synopsis") or manual_synopsis.strip() or None
-                        book_to_save = {**book, "cover_url": final_cover, "synopsis": final_synopsis}
+                        final_page_count = int(page_count_input) or None
+                        book_to_save = {
+                            **book, "cover_url": final_cover, "synopsis": final_synopsis,
+                            "page_count": final_page_count,
+                        }
                         start_add_flow(book_to_save, status)
                 st.divider()
 
@@ -1602,6 +1730,7 @@ with st.sidebar:
 
     for key, label, svg in nav_links:
         if st.button(f"{nav_icons.get(key, '')} {label}", key=f"nav_{key}"):
+            st.session_state.pop("detail_book_id", None)
             st.query_params["nav"] = key
             st.rerun()
 
